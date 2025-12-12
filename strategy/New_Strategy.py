@@ -408,15 +408,24 @@ class NewStrategy(Strategy):
         if current_price > indicators['sma_20']:
             score += 1
             reasons.append("Price above 20-day SMA")
+        elif current_price < indicators['sma_20']:
+            score -= 1
+            reasons.append("Price below 20-day SMA")
 
         if current_price > indicators['sma_50']:
             score += 1
             reasons.append("Price above 50-day SMA")
+        elif current_price < indicators['sma_50']:
+            score -= 1
+            reasons.append("Price below 50-day SMA")
 
         # MACD Analysis
         if indicators['macd'] > indicators['macd_signal']:
             score += 1
             reasons.append("MACD bullish crossover")
+        elif indicators['macd'] < indicators['macd_signal']:
+            score -= 1
+            reasons.append("MACD bearish crossover")
 
         # RSI Analysis
         if indicators['rsi'] < 30:
@@ -425,14 +434,8 @@ class NewStrategy(Strategy):
         elif indicators['rsi'] > 70:
             score -= 2
             reasons.append("RSI overbought (potential correction)")
-        # elif 50 < indicators['rsi'] <= 70:
-        #     score += 0
-        #     reasons.append("RSI approaching overbought (potential correction)")
-        # elif 30 <= indicators['rsi'] <= 50:
-        #     score += 1
-        #     reasons.append("RSI in neutral zone")
         else:
-             reasons.append("RSI in neutral zone")
+            reasons.append("RSI in neutral zone")
 
         # Bollinger Bands Analysis
         if indicators['bb_position'] < 0.2:
@@ -443,10 +446,10 @@ class NewStrategy(Strategy):
             reasons.append("Near upper Bollinger Band")
 
         # Momentum Analysis
-        if stock_data['price_change_1w'] > 10 : # was 5
+        if stock_data['price_change_1w'] > 10:
             score += 1
             reasons.append("Strong weekly momentum")
-        elif stock_data['price_change_1w'] < -15: # was -10
+        elif stock_data['price_change_1w'] < -15:
             score -= 1
             reasons.append("Weak weekly momentum")
         else:
@@ -479,11 +482,11 @@ class NewStrategy(Strategy):
         if score >= 4:
             analysis['recommendation'] = 'BUY'
             analysis['confidence'] = min(score * 15, 95)
-            analysis['target_price'] = current_price * 1.3 # was 1.15 15% profit now 1.3 30%
+            analysis['target_price'] = current_price * 1.3
         elif score <= -3:
             analysis['recommendation'] = 'SELL'
             analysis['confidence'] = min(abs(score) * 15, 95)
-            analysis['target_price'] = current_price * 0.8 # was 0.9 10% loss now 0.8 20%
+            analysis['target_price'] = current_price * 0.8
         else:
             analysis['recommendation'] = 'HOLD'
             analysis['confidence'] = 50
