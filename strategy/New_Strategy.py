@@ -188,7 +188,7 @@ class NewStrategy(Strategy):
                 # 3. check the signal and place order
                 if analysis['recommendation'] == "BUY":
                     # buy up to 20% of total portfolio of shares
-                    buy_qty = floor(self.max_buy_value / price)
+                    buy_qty = floor(self.max_buy_value / price * 1.05)
 
                     print('BUY Signals')
                     print(f"\n🟢 {stock} ({stock_data['sector']})")
@@ -466,16 +466,16 @@ class NewStrategy(Strategy):
             qty = position_data[stock]['qty']
             if qty > 0:
                 if profit_loss >= 25:
-                    score -= 3
+                    score -= 4
                     reasons.append(f"Large profit ({profit_loss:.1f}%) - consider taking profits")
                 elif profit_loss >= 20:
-                    score -= 2
+                    score -= 3
                     reasons.append(f"Medium profit ({profit_loss:.1f}%) - consider taking profits")
                 elif profit_loss <= -15:
-                    score -= 3
+                    score -= 5
                     reasons.append(f"Large loss ({profit_loss:.1f}%) - consider cutting losses")
                 elif profit_loss <= -10:
-                    score -= 2
+                    score -= 4
                     reasons.append(f"Medium loss ({profit_loss:.1f}%) - consider cutting losses")
 
         # Generate recommendation
