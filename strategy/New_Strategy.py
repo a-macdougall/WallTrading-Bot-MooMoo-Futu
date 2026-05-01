@@ -17,7 +17,8 @@ updated: 04/09/2024, output formatting
 import numpy as np
 import yfinance as yf
 from moomoo import *
-from numpy.ma.core import floor
+import math
+import time
 
 from strategy.Strategy import Strategy
 import pandas as pd
@@ -115,20 +116,38 @@ class NewStrategy(Strategy):
 
         prices = {}
 
+        data = yf.download(
+            self.stock_trading_list,
+            interval="1h",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True
+        )
+
         # please modify the following code to match your own strategy
         for index, stock in enumerate(self.stock_trading_list, start=1):
             try:
                 # 1. get the stock data from quoter, return a pandas dataframe
-                ticker = yf.Ticker(stock)
-                info = ticker.info
-                df = ticker.history(interval="1h", actions=False, prepost=False, raise_errors=True)
+                # ticker = yf.Ticker(stock)
+                # info = ticker.info
+                # df = ticker.history(interval="1h", actions=False, prepost=False, raise_errors=True)
+                # fast_info = ticker.fast_info
+                # market_cap = fast_info.get("market_cap", None)
 
-                price = info.get('currentPrice', 0) # more accurate price
+                if stock not in data.columns.get_level_values(0):
+                    continue
+                df = data[stock].dropna()
+                if len(df) < 2:
+                    continue
+
+                # price = info.get('currentPrice', 0) # more accurate price
+                price = df['Close'].iloc[-1]
 
                 prices[stock] = {'current_price': price}
 
                 if stock in position_data:
-                    qty = position_data[stock]["qty"]
+                    position = position_data.get(stock, {"qty": 0})
+                    qty = position["qty"]
                     already_own = qty > 0
                     if qty > 0:
                         holding = position_data[stock]
@@ -164,12 +183,18 @@ class NewStrategy(Strategy):
                     'price_change_1m': (
                             (price - df['Close'].iloc[-22]) / df['Close'].iloc[-22] * 100) if len(
                         df) >= 22 else 0,
-                    'volatility': df['Close'].pct_change().std() * np.sqrt(252) * 100,
+                    'volatility': df['Close'].pct_change().std() * np.sqrt(252 * 6.5) * 100,
                     #'volume': df['Volume'].iloc[-1],
-                    'volume': info.get('volume', 0), # more accurate
-                    'avg_volume': df['Volume'].mean(),
-                    'market_cap': info.get('marketCap', 0),
-                    'pe_ratio': info.get('trailingPE', 0),
+                    #'volume': info.get('volume', 0), # more accurate
+                    # 'volume': info.get('volume', 0),
+                    # 'avg_volume': df['Volume'].mean(),
+                    # 'market_cap': info.get('marketCap', 0),
+                    # 'pe_ratio': info.get('trailingPE', 0),
+                    'volume': df['Volume'].iloc[-1],
+                    'avg_volume': df['Volume'].rolling(20).mean().iloc[-1],
+                    'market_cap': None,  # removed (not available without .info)
+                    # 'market_cap': fast_info.get("market_cap", None),
+                    'pe_ratio': None,  # removed (not available without .info)
                     'sector': self.get_sector(stock),
                     'data': df
                 }
@@ -188,7 +213,8 @@ class NewStrategy(Strategy):
                 # 3. check the signal and place order
                 if analysis['recommendation'] == "BUY":
                     # buy up to 20% of total portfolio of shares
-                    buy_qty = floor(self.max_buy_value / price * 1.05)
+                    affordable_cap = min(self.max_buy_value, current_cash)
+                    buy_qty = math.floor(affordable_cap / price)
 
                     print('BUY Signals')
                     print(f"\n🟢 {stock} ({stock_data['sector']})")
@@ -220,8 +246,8 @@ class NewStrategy(Strategy):
 
                     if not already_own:
                         print("BUT don't own")
-                    elif -10 < profit_loss < 20:
-                        print("BUT want to make a profit")
+                    # elif -10 < profit_loss < 20:
+                    #    print("BUT want to make a profit")
                     else:
                         self.strategy_make_trade(action='SELL', stock=stock, price=price, qty=qty, position_data = position_data) # place order
 
@@ -337,35 +363,82 @@ class NewStrategy(Strategy):
 
         data = stock_data['data']
 
+        ema_12_series = data['Close'].ewm(span=12).mean()
+        ema_26_series = data['Close'].ewm(span=26).mean()
+
         indicators = {'sma_20': data['Close'].rolling(20).mean().iloc[-1],
                       'sma_50': data['Close'].rolling(50).mean().iloc[-1],
-                      'ema_12': data['Close'].ewm(span=12).mean().iloc[-1],
-                      'ema_26': data['Close'].ewm(span=26).mean().iloc[-1]}
+                      'ema_12': ema_12_series.iloc[-1],
+                      'ema_26': ema_26_series.iloc[-1]}
 
         # Moving averages
 
         # MACD
-        macd = indicators['ema_12'] - indicators['ema_26']
-        macd_signal = pd.Series(macd).ewm(span=9).mean()
-        indicators['macd'] = macd
-        indicators['macd_signal'] = macd_signal.iloc[-1] if not macd_signal.empty else 0
+        macd_series = ema_12_series - ema_26_series
+        macd_signal_series = macd_series.ewm(span=9).mean()
+        macd_hist = macd_series - macd_signal_series
+        macd_hist_prev = macd_hist.shift(1)
+        indicators['macd'] = macd_series.iloc[-1]
+        indicators['macd_signal'] = macd_signal_series.iloc[-1]
+        if len(macd_series) < 2:
+            indicators['macd_prev'] = macd_series.iloc[-1]
+            indicators['macd_signal_prev'] = macd_signal_series.iloc[-1]
+        else:
+            indicators['macd_prev'] = macd_series.iloc[-2]
+            indicators['macd_signal_prev'] = macd_signal_series.iloc[-2]
+        indicators['macd_hist'] = macd_hist.iloc[-1]
+        indicators['macd_hist_prev'] = macd_hist_prev.iloc[-1]
 
-        # RSI
+        # # RSI
+        # delta = data['Close'].diff()
+        # gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        # loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        # avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+        # avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+        # # rs = gain / (loss + 1e-9)
+        # rs = avg_gain / (avg_loss + 1e-9)
+        # rsi = 100 - (100 / (1 + rs))
+        # # indicators['rsi'] = (100 - (100 / (1 + rs))).iloc[-1]
+        # indicators['rsi'] = rsi
+
+        # RSI (Wilder smoothing)
         delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        indicators['rsi'] = (100 - (100 / (1 + rs))).iloc[-1]
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+        rs = avg_gain / (avg_loss + 1e-9)
+        rsi_series = 100 - (100 / (1 + rs))
+        indicators['rsi'] = rsi_series.iloc[-1]
 
         # Bollinger Bands
         bb_period = 20
         bb_std = data['Close'].rolling(bb_period).std().iloc[-1]
         bb_middle = data['Close'].rolling(bb_period).mean().iloc[-1]
-        indicators['bb_upper'] = bb_middle + (2 * bb_std)
-        indicators['bb_lower'] = bb_middle - (2 * bb_std)
+        bb_upper = bb_middle + (2 * bb_std)
+        bb_lower = bb_middle - (2 * bb_std)
+        indicators['bb_upper'] = bb_upper
+        indicators['bb_lower'] = bb_lower
         # indicators['bb_position'] = (data['Close'].iloc[-1] - indicators['bb_lower']) / (indicators['bb_upper'] - indicators['bb_lower'])
-        indicators['bb_position'] = (stock_data['current_price'] - indicators['bb_lower']) / (
-                    indicators['bb_upper'] - indicators['bb_lower']) # more accurate price
+        bb_range = (bb_upper - bb_lower)
+        if bb_range == 0:
+            indicators['bb_position'] = 0.5
+        else:
+            indicators['bb_position'] = (stock_data['current_price'] - bb_lower) / bb_range
+        indicators['bb_width'] = (bb_upper - bb_lower) / bb_middle
+
+        # ATR
+        high = stock_data['data']['High']
+        low = stock_data['data']['Low']
+        close = stock_data['data']['Close']
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        indicators['atr'] = atr
 
         logging_info(f'{self.strategy_name}: stock = {stock}, indicators calculated')
         return indicators
@@ -391,41 +464,51 @@ class NewStrategy(Strategy):
             'current_price': current_price,
             'recommendation': 'HOLD',
             'confidence': 0,
-            'reasons': [],
-            'target_price': current_price,
-            'stop_loss': current_price * 0.9,
+            'reasons': [] #,
+            # 'target_price': current_price,
+            # 'stop_loss': current_price * 0.9, # ATR suggested but not actually using this value
         }
 
         # Calculate technical indicators
         indicators = self.calculate_technical_indicators(stock, stock_data)
 
+        atr = indicators['atr']
+        analysis['target_price'] = current_price + 3 * atr
+        analysis['stop_loss'] = current_price - 2 * atr
+
         score = 0
         reasons = []
+
+        sma20 = indicators['sma_20']
+        sma50 = indicators['sma_50']
 
         # Technical Analysis Scoring
 
         # Moving Average Analysis
-        if current_price > indicators['sma_20']:
+        if current_price > sma20:
             score += 1
             reasons.append("Price above 20-day SMA")
-        elif current_price < indicators['sma_20']:
+        elif current_price < sma20:
             score -= 1
             reasons.append("Price below 20-day SMA")
 
-        if current_price > indicators['sma_50']:
+        if current_price > sma50:
             score += 1
             reasons.append("Price above 50-day SMA")
-        elif current_price < indicators['sma_50']:
+        elif current_price < sma50:
             score -= 1
             reasons.append("Price below 50-day SMA")
 
-        # MACD Analysis
-        if indicators['macd'] > indicators['macd_signal']:
-            score += 1
-            reasons.append("MACD bullish crossover")
-        elif indicators['macd'] < indicators['macd_signal']:
-            score -= 1
-            reasons.append("MACD bearish crossover")
+        if sma20 > sma50:
+            if current_price > sma20:
+                score += 1
+                reasons.append("Bullish MA alignment (SMA20 > SMA50, price above SMA20)")
+            else:
+                score += 0  # optional neutrality
+        elif sma20 < sma50:
+            if current_price < sma20:
+                score -= 1
+                reasons.append("Bearish MA alignment (SMA20 < SMA50, price below SMA20)")
 
         # RSI Analysis
         if indicators['rsi'] < 30:
@@ -438,12 +521,48 @@ class NewStrategy(Strategy):
             reasons.append("RSI in neutral zone")
 
         # Bollinger Bands Analysis
+        if indicators['bb_width'] < 0.03:
+            score -= 1
+            reasons.append("Low volatility (no trade zone)")
+
         if indicators['bb_position'] < 0.2:
             score += 1
             reasons.append("Near lower Bollinger Band")
         elif indicators['bb_position'] > 0.8:
             score -= 1
             reasons.append("Near upper Bollinger Band")
+
+        trend_score = 0
+        mean_reversion_score = 0
+        volatility_penalty = 0
+
+        # Trend: use SMA alignment, not individual comparisons
+        if indicators['sma_50'] < indicators['sma_20'] < current_price:
+            trend_score += 2
+            reasons.append("Strong uptrend (price > SMA20 > SMA50)")
+
+        elif indicators['sma_50'] > indicators['sma_20'] > current_price:
+            trend_score -= 2
+            reasons.append("Strong downtrend (price < SMA20 < SMA50)")
+
+        # MACD Analysis
+        # MACD Analysis (real crossover)
+        if indicators['macd_prev'] < indicators['macd_signal_prev'] and indicators['macd'] > indicators['macd_signal'] :
+            score += 1
+            reasons.append("MACD bullish crossover")
+        elif indicators['macd_prev'] > indicators['macd_signal_prev'] and indicators['macd'] < indicators['macd_signal']:
+            score -= 1
+            reasons.append("MACD bearish crossover")
+        else:
+            reasons.append("MACD no crossover")
+
+        # MACD momentum
+        if indicators['macd_hist'] > indicators['macd_hist_prev']:
+            score += 1
+            reasons.append("MACD momentum increasing")
+        elif indicators['macd_hist'] < indicators['macd_hist_prev']:
+            score -= 1
+            reasons.append("MACD momentum weakening")
 
         # Momentum Analysis
         if stock_data['price_change_1w'] > 10:
@@ -456,21 +575,22 @@ class NewStrategy(Strategy):
             reasons.append("Neutral momentum")
 
         # Volume Analysis
-        volume_ratio = stock_data['volume'] / stock_data['avg_volume']
+        volume_ratio = stock_data['volume'] / (stock_data['avg_volume'] + 1e-9)
         if volume_ratio > 1.5:
             score += 1
             reasons.append("Above average volume")
 
         if stock in position_data:
             profit_loss = stock_data['profit_loss']
-            qty = position_data[stock]['qty']
+            position = position_data.get(stock, {"qty": 0})
+            qty = position["qty"]
             if qty > 0:
-                if profit_loss >= 25:
-                    score -= 4
-                    reasons.append(f"Large profit ({profit_loss:.1f}%) - consider taking profits")
-                elif profit_loss >= 20:
+                if profit_loss >= 25 and indicators['rsi'] > 70:
                     score -= 3
-                    reasons.append(f"Medium profit ({profit_loss:.1f}%) - consider taking profits")
+                    reasons.append(f"Large profit ({profit_loss:.1f}%) - consider taking profits")
+                # elif profit_loss >= 20:
+                #     score -= 3
+                #     reasons.append(f"Medium profit ({profit_loss:.1f}%) - consider taking profits")
                 elif profit_loss <= -15:
                     score -= 5
                     reasons.append(f"Large loss ({profit_loss:.1f}%) - consider cutting losses")
@@ -478,8 +598,22 @@ class NewStrategy(Strategy):
                     score -= 4
                     reasons.append(f"Medium loss ({profit_loss:.1f}%) - consider cutting losses")
 
+        # Neutral penalty balancing (bounded signal)
+        if abs(score) < 1.5:
+            score = 0
+        elif abs(score) < 2:
+            score *= 0.6
+        elif abs(score) < 4:
+            score *= 0.85
+        # score = max(min(score, 8), -8)
+        # score = np.tanh(score / 5) * 5
+
         # Generate recommendation
-        if score >= 4:
+        if abs(score) < 2:
+            analysis['recommendation'] = 'HOLD'
+            analysis['confidence'] = 40
+            analysis['reasons'].append("No-trade zone (low signal strength)")
+        elif score >= 4:
             analysis['recommendation'] = 'BUY'
             analysis['confidence'] = min(score * 15, 95)
             analysis['target_price'] = current_price * 1.3

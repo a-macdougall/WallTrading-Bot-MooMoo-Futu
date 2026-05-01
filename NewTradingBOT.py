@@ -17,6 +17,7 @@
 
 from moomoo import *
 import schedule
+import time
 
 from env.NewSecret import moomoo_pwd
 from strategy.New_Strategy import NewStrategy
@@ -254,7 +255,7 @@ if __name__ == '__main__':
     print("Trader and strategy objects created...")
 
     # test the strategy
-    # strategy.strategy_decision()
+    strategy.strategy_decision()
 
     # schedule the task
     bot_task = schedule.Scheduler()
