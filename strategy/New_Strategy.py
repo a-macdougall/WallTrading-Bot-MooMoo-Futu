@@ -532,17 +532,13 @@ class NewStrategy(Strategy):
             score -= 1
             reasons.append("Near upper Bollinger Band")
 
-        trend_score = 0
-        mean_reversion_score = 0
-        volatility_penalty = 0
-
         # Trend: use SMA alignment, not individual comparisons
         if indicators['sma_50'] < indicators['sma_20'] < current_price:
-            trend_score += 2
+            score += 2
             reasons.append("Strong uptrend (price > SMA20 > SMA50)")
 
         elif indicators['sma_50'] > indicators['sma_20'] > current_price:
-            trend_score -= 2
+            score -= 2
             reasons.append("Strong downtrend (price < SMA20 < SMA50)")
 
         # MACD Analysis
