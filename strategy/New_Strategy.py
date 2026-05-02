@@ -98,12 +98,18 @@ class NewStrategy(Strategy):
         if pos_ret != RET_OK:
             return False
 
-        current_portfolio = current_cash
+        current_portfolio = current_cash # + sum(pos["qty"] * pos.get("market_price", pos["cost_price"]) for pos in position_data.values() if pos["qty"] > 0)
 
-        for stock in position_data:
-            qty = position_data[stock]['qty']
+        # for stock in position_data:
+        #     qty = position_data[stock]['qty']
+        #     if qty > 0:
+        #         current_portfolio = current_portfolio + position_data[stock]['market_val']
+
+        for stock, pos in position_data.items():
+            qty = pos.get("qty", 0)
             if qty > 0:
-                current_portfolio = current_portfolio + position_data[stock]['market_val']
+                price = pos.get("market_price", pos.get("cost_price", 0))
+                current_portfolio += qty * price
 
         # max buy value 20% of total portfolio
         self.max_buy_value = current_portfolio * 0.2
@@ -137,7 +143,7 @@ class NewStrategy(Strategy):
                 if stock not in data.columns.get_level_values(0):
                     continue
                 df = data[stock].dropna()
-                if len(df) < 2:
+                if len(df) < 30:
                     continue
 
                 # price = info.get('currentPrice', 0) # more accurate price
@@ -213,7 +219,8 @@ class NewStrategy(Strategy):
                 # 3. check the signal and place order
                 if analysis['recommendation'] == "BUY":
                     # buy up to 20% of total portfolio of shares
-                    affordable_cap = min(self.max_buy_value, current_cash)
+                    max_position_cap = current_portfolio * 0.2
+                    affordable_cap = min(self.max_buy_value, current_cash, max_position_cap)
                     buy_qty = math.floor(affordable_cap / price)
 
                     print('BUY Signals')
@@ -249,6 +256,8 @@ class NewStrategy(Strategy):
                     # elif -10 < profit_loss < 20:
                     #    print("BUT want to make a profit")
                     else:
+                        qty = position_data[stock]["qty"]
+                        # if qty > 0:
                         self.strategy_make_trade(action='SELL', stock=stock, price=price, qty=qty, position_data = position_data) # place order
 
                 time.sleep(1)  # sleep 1 second to avoid the quote limit
@@ -377,7 +386,7 @@ class NewStrategy(Strategy):
         macd_series = ema_12_series - ema_26_series
         macd_signal_series = macd_series.ewm(span=9).mean()
         macd_hist = macd_series - macd_signal_series
-        macd_hist_prev = macd_hist.shift(1)
+        macd_hist_prev = macd_hist.iloc[-2] if len(macd_hist) > 1 else 0
         indicators['macd'] = macd_series.iloc[-1]
         indicators['macd_signal'] = macd_signal_series.iloc[-1]
         if len(macd_series) < 2:
@@ -387,7 +396,7 @@ class NewStrategy(Strategy):
             indicators['macd_prev'] = macd_series.iloc[-2]
             indicators['macd_signal_prev'] = macd_signal_series.iloc[-2]
         indicators['macd_hist'] = macd_hist.iloc[-1]
-        indicators['macd_hist_prev'] = macd_hist_prev.iloc[-1]
+        indicators['macd_hist_prev'] = macd_hist_prev
 
         # # RSI
         # delta = data['Close'].diff()
@@ -432,12 +441,11 @@ class NewStrategy(Strategy):
         low = stock_data['data']['Low']
         close = stock_data['data']['Close']
         prev_close = close.shift(1)
-        tr = pd.concat([
-            (high - low),
-            (high - prev_close).abs(),
-            (low - prev_close).abs()
-        ], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
+        hl = high - low
+        hc = (high - prev_close).abs()
+        lc = (low - prev_close).abs()
+        tr = pd.DataFrame({"hl": hl, "hc": hc, "lc": lc}).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else tr.mean()
         indicators['atr'] = atr
 
         logging_info(f'{self.strategy_name}: stock = {stock}, indicators calculated')
@@ -475,6 +483,8 @@ class NewStrategy(Strategy):
         atr = indicators['atr']
         analysis['target_price'] = current_price + 3 * atr
         analysis['stop_loss'] = current_price - 2 * atr
+        analysis['force_sell'] = current_price <= analysis["stop_loss"]
+        analysis['force_take_profit'] = current_price >= analysis["target_price"]
 
         score = 0
         reasons = []
@@ -521,7 +531,7 @@ class NewStrategy(Strategy):
             reasons.append("RSI in neutral zone")
 
         # Bollinger Bands Analysis
-        if indicators['bb_width'] < 0.03:
+        if indicators['bb_width'] < 0.02:
             score -= 1
             reasons.append("Low volatility (no trade zone)")
 
@@ -542,23 +552,37 @@ class NewStrategy(Strategy):
             reasons.append("Strong downtrend (price < SMA20 < SMA50)")
 
         # MACD Analysis
-        # MACD Analysis (real crossover)
-        if indicators['macd_prev'] < indicators['macd_signal_prev'] and indicators['macd'] > indicators['macd_signal'] :
-            score += 1
-            reasons.append("MACD bullish crossover")
-        elif indicators['macd_prev'] > indicators['macd_signal_prev'] and indicators['macd'] < indicators['macd_signal']:
-            score -= 1
-            reasons.append("MACD bearish crossover")
+        # MACD Analysis crossover
+        macd_hist_prev = indicators['macd_hist_prev']
+        macd_hist = indicators['macd_hist']
+        # --- crossover (regime change) ---
+        crossover_signal = 0
+        if macd_hist_prev < 0 < macd_hist:
+            crossover_signal = 2
+            reasons.append("MACD bullish crossover (histogram crossed above 0)")
+        elif macd_hist_prev > 0 > macd_hist:
+            crossover_signal = -2
+            reasons.append("MACD bearish crossover (histogram crossed below 0)")
         else:
             reasons.append("MACD no crossover")
+        score += crossover_signal
+        # --- momentum (trend strength) ---
+        momentum_signal = 0
+        if macd_hist > 0 and macd_hist > macd_hist_prev:
+            momentum_signal = 1
+            reasons.append("Positive MACD momentum strengthening")
+        elif macd_hist < 0 and macd_hist < macd_hist_prev:
+            momentum_signal = -1
+            reasons.append("Negative MACD momentum strengthening")
+        score += momentum_signal
 
-        # MACD momentum
-        if indicators['macd_hist'] > indicators['macd_hist_prev']:
-            score += 1
-            reasons.append("MACD momentum increasing")
-        elif indicators['macd_hist'] < indicators['macd_hist_prev']:
-            score -= 1
-            reasons.append("MACD momentum weakening")
+        # # MACD momentum
+        # if indicators['macd_hist'] > indicators['macd_hist_prev']:
+        #     score += 1
+        #     reasons.append("MACD momentum increasing")
+        # elif indicators['macd_hist'] < indicators['macd_hist_prev']:
+        #     score -= 1
+        #     reasons.append("MACD momentum weakening")
 
         # Momentum Analysis
         if stock_data['price_change_1w'] > 10:
@@ -571,7 +595,17 @@ class NewStrategy(Strategy):
             reasons.append("Neutral momentum")
 
         # Volume Analysis
-        volume_ratio = stock_data['volume'] / (stock_data['avg_volume'] + 1e-9)
+        avg_vol = stock_data.get('avg_volume', 0)
+
+        if avg_vol < 1e5:
+            reasons.append("Low liquidity warning")
+            score -= 1
+
+        if not avg_vol or np.isnan(avg_vol) or avg_vol == 0:
+            volume_ratio = 1
+        else:
+            volume_ratio = stock_data['volume'] / avg_vol
+
         if volume_ratio > 1.5:
             score += 1
             reasons.append("Above average volume")
@@ -594,29 +628,34 @@ class NewStrategy(Strategy):
                     score -= 4
                     reasons.append(f"Medium loss ({profit_loss:.1f}%) - consider cutting losses")
 
+                # if current_price <= analysis["stop_loss"]:
+                #     score = -10  # force SELL
+                #     reasons.append("Stop-loss triggered")
+                #
+                # elif current_price >= analysis["target_price"]:
+                #     score = -10  # force SELL
+                #     reasons.append("Take-profit triggered")
+
         # Neutral penalty balancing (bounded signal)
-        if abs(score) < 1.5:
-            score = 0
-        elif abs(score) < 2:
-            score *= 0.6
-        elif abs(score) < 4:
-            score *= 0.85
+        # if abs(score) < 1.5:
+        #     score = 0
+        # elif abs(score) < 2:
+        #     score *= 0.6
+        # elif abs(score) < 4:
+        #     score *= 0.85
         # score = max(min(score, 8), -8)
         # score = np.tanh(score / 5) * 5
 
         # Generate recommendation
-        if abs(score) < 2:
-            analysis['recommendation'] = 'HOLD'
-            analysis['confidence'] = 40
-            analysis['reasons'].append("No-trade zone (low signal strength)")
-        elif score >= 4:
+        if analysis["force_sell"] or analysis["force_take_profit"]:
+            analysis['recommendation'] = "SELL"
+            analysis['confidence'] = 100
+        elif score >= 3:
             analysis['recommendation'] = 'BUY'
             analysis['confidence'] = min(score * 15, 95)
-            analysis['target_price'] = current_price * 1.3
         elif score <= -3:
             analysis['recommendation'] = 'SELL'
             analysis['confidence'] = min(abs(score) * 15, 95)
-            analysis['target_price'] = current_price * 0.8
         else:
             analysis['recommendation'] = 'HOLD'
             analysis['confidence'] = 50
@@ -652,6 +691,7 @@ class NewStrategy(Strategy):
             qty = position_data[stock]['qty']
             if qty > 0:
                 price = prices[stock]['current_price']
+                # price = pos.get("market_price", pos.get("cost_price", 0))
                 amount = qty * price
                 current_portfolio = current_portfolio + amount
                 print(f'{stock} Qty {qty:.0f} Price ${price:.2f} Amount ${amount:.2f}')
