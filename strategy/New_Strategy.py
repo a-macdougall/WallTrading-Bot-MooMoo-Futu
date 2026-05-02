@@ -157,7 +157,7 @@ class NewStrategy(Strategy):
                     qty = position["qty"]
                     already_own = qty > 0
                     if qty > 0:
-                        holding = position_data[stock]
+                        holding = position_data.get(stock, {})
                         # price = holding['nominal_price'] # more accurate price
                         cost_price = holding['cost_price'] # average_cost = cost_price same when only making one purchase per stock
                         profit_loss = (price - cost_price) / cost_price * 100
@@ -234,16 +234,16 @@ class NewStrategy(Strategy):
                 if analysis['recommendation'] == "BUY":
                     # buy up to 20% of total portfolio of shares
                     # existing_value = qty * price if already_own else 0
-                    position = position_data.get(stock, {"qty": 0, "cost_price": price})
+                    position = position_data.get(stock, {})
                     qty_held = position.get("qty", 0)
 
-                    if qty_held > 0:
-                        buy_qty = 0
-                    else:
-                        existing_value = qty_held * position.get("cost_price", price)
-                        remaining_cap = max(0, self.max_buy_value - existing_value)
-                        affordable_cap = min(current_cash, remaining_cap)
-                        buy_qty = math.floor(affordable_cap / price)
+                    # if qty_held > 0:
+                    #     buy_qty = 0
+                    # else:
+                    cost_price = position.get("cost_price", price)
+                    existing_value = qty_held * cost_price
+                    remaining_cap = max(0, self.max_buy_value - existing_value)
+                    buy_qty = math.floor(min(current_cash, remaining_cap) / price)
 
                     print('BUY Signals')
                     print(f"\n🟢 {stock} ({stock_data['sector']})")
@@ -277,8 +277,9 @@ class NewStrategy(Strategy):
                         print("BUT don't own")
                     else:
                         # sell_qty = position_data[stock]["qty"]
-                        sell_qty = position_data.get(stock, {}).get("qty", 0)
+                        # sell_qty = position_data.get(stock, {}).get("qty", 0)
                         # if qty > 0:
+                        sell_qty = qty
                         self.strategy_make_trade(action='SELL', stock=stock, price=price, qty=sell_qty, position_data = position_data) # place order
 
                 time.sleep(1)  # sleep 1 second to avoid the quote limit
@@ -547,13 +548,17 @@ class NewStrategy(Strategy):
 
         # RSI Analysis
         if indicators['rsi'] < 30:
-            score += 2
+            score += 1.5
             reasons.append("RSI oversold (potential bounce)")
         elif indicators['rsi'] > 70:
-            score -= 2
+            score -= 1.5
             reasons.append("RSI overbought (potential correction)")
         else:
             reasons.append("RSI in neutral zone")
+
+        # if stock_data['volatility'] > 60:
+        #     score -= 1
+        #     reasons.append("High volatility risk")
 
         # Bollinger Bands Analysis
         low_vol = indicators['bb_width'] < 0.02
@@ -574,10 +579,10 @@ class NewStrategy(Strategy):
         macd_hist = indicators['macd_hist']
         # crossover
         if macd_hist_prev < 0 < macd_hist:
-            score += 1.5
+            score += 1
             reasons.append("MACD bullish crossover")
         elif macd_hist_prev > 0 > macd_hist:
-            score -= 1.5
+            score -= 1
             reasons.append("MACD bearish crossover")
 
         # Momentum Analysis
@@ -599,8 +604,12 @@ class NewStrategy(Strategy):
         else:
             volume_ratio = stock_data['volume'] / avg_vol
             if volume_ratio > 1.5:
-                score += 1
-                reasons.append("Above average volume")
+                if current_price > sma20:
+                    score += 1
+                    reasons.append("Bullish volume expansion")
+                else:
+                    score -= 1
+                    reasons.append("Bearish volume expansion")
 
         if stock in position_data:
             profit_loss = stock_data['profit_loss']
@@ -620,16 +629,16 @@ class NewStrategy(Strategy):
                     score -= 2
                     reasons.append(f"Medium loss ({profit_loss:.1f}%) - consider cutting losses")
 
-        if analysis["force_sell"]:
+        if analysis["force_sell"] or analysis["force_take_profit"]:
             analysis['recommendation'] = "SELL"
             analysis['confidence'] = 100
-            analysis['reasons'] = reasons + ["Stop-loss triggered"]
+            analysis['reasons'] = reasons # + ["Stop-loss triggered"]
             analysis['score'] = score
             return analysis
 
-        if analysis["force_take_profit"]:
-            score -= 2
-            reasons.append("Take-profit zone (ATR)")
+        # if analysis["force_take_profit"]:
+        #     score -= 2
+        #     reasons.append("Take-profit zone (ATR)")
 
         score = max(min(score, 8), -8)
 
