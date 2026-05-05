@@ -19,6 +19,12 @@ import yfinance as yf
 from moomoo import *
 import math
 import time
+# finbert
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+# marketaux
+import requests
+from env.NewSecret import marketaux_api_key
 
 from strategy.Strategy import Strategy
 import pandas as pd
@@ -78,6 +84,26 @@ class NewStrategy(Strategy):
 
         # please add any other settings here based on your strategy
 
+        # --- FinBERT init ---
+        self.finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        self.finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.finbert_model.to(self.device)
+
+        if self.device.type == "cuda":
+            self.finbert_model = self.finbert_model.half()
+
+        self.finbert_model.eval()
+
+        print(f"FinBERT running on: {self.device}")
+
+        # --- Marketaux API ---
+        self.marketaux_api_key = marketaux_api_key
+
+        # --- News cache ---
+        self.news_cache = {}
+
         """⬆️⬆️⬆️ Strategy Settings ⬆️⬆️⬆️"""
 
         print(f"Strategy {self.strategy_name} initialized...")
@@ -131,6 +157,50 @@ class NewStrategy(Strategy):
             threads=True
         )
 
+        # STEP 1: collect everything first
+        for index, stock in enumerate(self.stock_trading_list, start=1):
+
+            if stock not in data.columns.get_level_values(0):
+                continue
+
+            df = data[stock].dropna()
+            if len(df) < 30:
+                continue
+
+            # --- cached news ---
+            if stock not in self.news_cache:
+                try:
+                    url = "https://api.marketaux.com/v1/news/all"
+                    params = {
+                        "symbols": stock,
+                        "language": "en",
+                        "limit": 5,
+                        "api_token": self.marketaux_api_key
+                    }
+
+                    response = requests.get(url, params=params, timeout=5)
+                    json_data = response.json()
+
+                    self.news_cache[stock] = [
+                        article["title"]
+                        for article in json_data.get("data", [])
+                        if "title" in article
+                    ]
+
+                except Exception:
+                    self.news_cache[stock] = []
+
+        stock_text_pairs = []
+
+        for stock, texts in self.news_cache.items():
+            for t in texts[:3]:
+                stock_text_pairs.append((stock, t))
+
+        texts = [t for _, t in stock_text_pairs]
+        stocks = [s for s, _ in stock_text_pairs]
+
+        sentiment_map = self.get_batch_sentiment_score(texts, stocks)
+
         # please modify the following code to match your own strategy
         for index, stock in enumerate(self.stock_trading_list, start=1):
             try:
@@ -151,6 +221,10 @@ class NewStrategy(Strategy):
                 price = df['Close'].iloc[-1]
 
                 prices[stock] = {'current_price': price}
+
+                sentiment_score = sentiment_map.get(stock)
+                if sentiment_score is None:
+                    sentiment_score = 0
 
                 if stock in position_data:
                     position = position_data.get(stock, {"qty": 0})
@@ -219,13 +293,14 @@ class NewStrategy(Strategy):
                     'data': df
                 }
 
+                indicator = "* " if already_own else ""
                 # 2. calculate the indicator
-                print(f'Analysing {stock_data["sector"]} - {stock} {index}/{len(self.stock_trading_list)}')
+                print(f'{indicator}Analysing {stock_data["sector"]} - {stock} {index}/{len(self.stock_trading_list)}')
 
-                analysis = self.analyze_stock(stock, stock_data, position_data)
+                analysis = self.analyze_stock(stock, stock_data, position_data, sentiment_score)
                 recommendation = analysis['recommendation']
                 reason = ', '.join(analysis['reasons'][:3])
-                print(f'Recommendation {recommendation} - {reason}')
+                print(f'    Recommendation {recommendation} - {reason}')
 
                 if already_own:
                     print(f'Current profit/loss {profit_loss:.2f}% ${profit_loss_amount:.2f}')
@@ -298,6 +373,42 @@ class NewStrategy(Strategy):
         print("Strategy checked... Waiting next decision called...")
         print('---------------------------------------------------')
         return None
+
+    def get_batch_sentiment_score(self, texts, stocks):
+        if not texts:
+            return {}
+
+        inputs = self.finbert_tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        )
+
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            outputs = self.finbert_model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+
+        stock_scores = {}
+        stock_counts = {}
+
+        for i, p in enumerate(probs):
+            neg, neu, pos = p.tolist()
+
+            # FIX: damp neutral noise (important)
+            score = pos - neg - 0.2 * neu
+
+            stock = stocks[i]
+
+            stock_scores[stock] = stock_scores.get(stock, 0) + score
+            stock_counts[stock] = stock_counts.get(stock, 0) + 1
+
+        for stock in stock_scores:
+            stock_scores[stock] /= stock_counts[stock]
+
+        return stock_scores
 
     """ ⬇️⬇️⬇️ Order related functions ⬇️⬇️⬇️"""
 
@@ -476,7 +587,7 @@ class NewStrategy(Strategy):
         logging_info(f'{self.strategy_name}: stock = {stock}, indicators calculated')
         return indicators
 
-    def analyze_stock(self, stock: str, stock_data: Dict, position_data: Dict) -> Dict:
+    def analyze_stock(self, stock: str, stock_data: Dict, position_data: Dict, sentiment_score: float = 0) -> Dict:
         """
         Analyze a single stock and generate buy/sell recommendation
 
@@ -484,6 +595,7 @@ class NewStrategy(Strategy):
             stock: Stock symbol
             stock_data: Stock data dictionary
             position_data: Position dictionary
+            sentiment_score: Float
 
         Returns:
             Analysis dictionary
@@ -513,6 +625,16 @@ class NewStrategy(Strategy):
 
         score = 0
         reasons = []
+
+        # --- FinBERT sentiment impact ---
+        if sentiment_score > 0.2:
+            score += sentiment_score * 2
+            reasons.append("Positive sentiment")
+        elif sentiment_score < -0.2:
+            score += sentiment_score * 2
+            reasons.append("Negative sentiment")
+        else:
+            reasons.append("Neutral sentiment")
 
         sma20 = indicators['sma_20']
         sma50 = indicators['sma_50']
